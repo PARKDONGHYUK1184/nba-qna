@@ -1,393 +1,407 @@
 import pandas as pd
-import numpy as np
-import os
-import threading
-import time
+import re
 from flask import Flask, request, jsonify, render_template_string
-from functools import lru_cache
+from datetime import datetime
 
-# ----------------------------------------------------------------------
-# 1. 설정 및 초기화
-# ----------------------------------------------------------------------
+# 데이터 로딩
+try:
+    # Heroku 환경에서는 파일 경로가 다를 수 있으므로 현재 디렉토리에서 찾습니다.
+    # 만약 에러가 발생하면 절대 경로를 사용해야 할 수도 있습니다.
+    per_game_df = pd.read_csv('per_game.csv')
+    standings_df = pd.read_csv('standings.csv')
+    
+    # 선수 이름 전처리: 검색을 용이하게 하기 위해 소문자화 및 공백 제거
+    per_game_df['Player_lower'] = per_game_df['Player'].str.lower().str.replace('[^a-zA-Z\s]', '', regex=True).str.strip()
+    
+    data_loaded = True
+    print("DEBUG: 데이터 파일(per_game.csv, standings.csv) 로드 성공")
+except FileNotFoundError:
+    data_loaded = False
+    print("ERROR: 데이터 파일을 찾을 수 없습니다. per_game.csv와 standings.csv를 확인하세요.")
+except Exception as e:
+    data_loaded = False
+    print(f"ERROR: 데이터 로드 중 오류 발생: {e}")
+
+
 app = Flask(__name__)
-# 현재 실행 디렉토리를 기준으로 설정
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# 🚨 파일 경로 설정 (data 폴더 안의 per_game.csv, standings.csv 사용)
-PLAYER_DATA_PATH = os.path.join(BASE_DIR, 'data', 'per_game.csv')
-STANDINGS_DATA_PATH = os.path.join(BASE_DIR, 'data', 'standings.csv')
+# --- 데이터 검색 함수 ---
 
-# 전역 데이터 변수
-player_data_df = None
-standings_data_df = None
-player_list = [] # 선수 이름 리스트
-team_abbr_map = {
-    'Atlanta Hawks': 'ATL', 'Boston Celtics': 'BOS', 'Brooklyn Nets': 'BRK',
-    'Charlotte Hornets': 'CHO', 'Chicago Bulls': 'CHI', 'Cleveland Cavaliers': 'CLE',
-    'Dallas Mavericks': 'DAL', 'Denver Nuggets': 'DEN', 'Detroit Pistons': 'DET',
-    'Golden State Warriors': 'GSW', 'Houston Rockets': 'HOU', 'Indiana Pacers': 'IND',
-    'LA Clippers': 'LAC', 'Los Angeles Lakers': 'LAL', 'Memphis Grizzlies': 'MEM',
-    'Miami Heat': 'MIA', 'Milwaukee Bucks': 'MIL', 'Minnesota Timberwolves': 'MIN',
-    'New Orleans Pelicans': 'NOP', 'New York Knicks': 'NYK', 'Oklahoma City Thunder': 'OKC',
-    'Orlando Magic': 'ORL', 'Philadelphia 76ers': 'PHI', 'Phoenix Suns': 'PHO',
-    'Portland Trail Blazers': 'POR', 'Sacramento Kings': 'SAC', 'San Antonio Spurs': 'SAS',
-    'Toronto Raptors': 'TOR', 'Utah Jazz': 'UTA', 'Washington Wizards': 'WAS'
-}
-
-# ----------------------------------------------------------------------
-# 2. 데이터 로딩 함수 (백그라운드 스레드)
-# ----------------------------------------------------------------------
-
-def load_data():
-    """CSV 파일을 읽어와 전역 데이터프레임을 채우는 함수."""
-    global player_data_df, standings_data_df, player_list
-    print("⏳ 데이터 로딩 스레드 시작...")
-    
-    try:
-        # 선수 데이터 로드
-        player_data_df = pd.read_csv(PLAYER_DATA_PATH)
-        player_data_df = player_data_df.rename(columns={'Player': 'Player', 'Tm': 'Team'})
-        player_data_df = player_data_df.fillna(0)
-        player_list = sorted(player_data_df['Player'].unique().tolist())
-        
-        print(f"✅ 선수 데이터 로드 완료: {len(player_data_df)} 행")
-
-        # 팀 순위 데이터 로드
-        standings_data_df = pd.read_csv(STANDINGS_DATA_PATH)
-        standings_data_df = standings_data_df.rename(columns={'Team Name': 'Team'})
-        standings_data_df['Team Abbr'] = standings_data_df['Team'].map(team_abbr_map).fillna(standings_data_df['Team'])
-        print(f"✅ 순위 데이터 로드 완료: {len(standings_data_df)} 행")
-
-        print("🎉 모든 데이터 로드 및 전처리 완료.")
-        
-    except FileNotFoundError as e:
-        print(f"❌ 데이터 파일을 찾을 수 없어, 명단 및 검색 기능을 사용할 수 없습니다. 오류: {e}")
-    except Exception as e:
-        print(f"❌ 데이터 로딩 중 예상치 못한 오류 발생: {e}")
-
-# 서버 시작 시 데이터 로드를 백그라운드 스레드로 실행
-data_thread = threading.Thread(target=load_data)
-data_thread.daemon = True 
-data_thread.start()
-
-# ----------------------------------------------------------------------
-# 3. 데이터 분석 및 질의응답 로직
-# ----------------------------------------------------------------------
-
-# 선수 스탯 검색 (캐싱 적용)
-@lru_cache(maxsize=128)
 def search_player_stats(player_name, season):
-    """특정 시즌의 특정 선수의 주요 기록을 조회합니다."""
-    if player_data_df is None:
+    """특정 선수의 특정 시즌 주요 기록을 검색합니다."""
+    
+    # season 형식 처리 (예: '2023-24')
+    if not re.match(r'\d{4}-\d{2}', season):
+        print(f"DEBUG: 잘못된 시즌 형식: {season}")
         return None
     
-    df_player = player_data_df[
-        (player_data_df['Player'].str.contains(player_name, case=False, na=False)) & 
-        (player_data_df['Season'] == season)
-    ]
+    # 선수 이름 전처리
+    player_lower = player_name.lower().replace('[^a-zA-Z\s]', '', regex=True).strip()
+
+    # 데이터 프레임에서 검색
+    result = per_game_df[(per_game_df['Player_lower'] == player_lower) & (per_game_df['Season'] == season)]
     
-    if df_player.empty:
-        return None
+    if result.empty:
+        return f"ERROR: {season} 시즌 {player_name} 선수의 기록을 찾을 수 없습니다. 이름이나 시즌을 확인해 주세요."
     
-    df_player = df_player.sort_values(by='G', ascending=False).iloc[0]
+    # 필요한 주요 기록만 추출 및 포맷팅
+    stats = result.iloc[0]
+    output = f"""
+    ### 🏀 {season} 시즌 {stats['Player']} 주요 기록
+    - **소속팀**: {stats['Tm']}
+    - **경기 수**: {stats['G']}
+    - **출전 시간 (MP)**: {stats['MP']:.1f}
+    - **득점 (PTS)**: {stats['PTS']:.1f}
+    - **리바운드 (TRB)**: {stats['TRB']:.1f}
+    - **어시스트 (AST)**: {stats['AST']:.1f}
+    - **FG%**: {stats['FG%']:.3f}
+    - **3P%**: {stats['3P%']:.3f}
+    """
+    return output
+
+def search_top_players(season, stat_category, top_n=5):
+    """특정 시즌 특정 스탯 카테고리의 TOP N 선수를 검색합니다."""
     
-    stats_to_show = ['G', 'MP', 'FG%', 'TRB', 'AST', 'STL', 'BLK', 'PTS']
-    result = {
-        'Player': df_player['Player'],
-        'Team': df_player['Team'],
-        'Season': df_player['Season'],
+    # Stat 카테고리 매핑 (사용자 친화적인 이름 -> CSV 컬럼 이름)
+    stat_map = {
+        '득점': 'PTS', '리바운드': 'TRB', '어시스트': 'AST',
+        '스틸': 'STL', '블록': 'BLK', '자유투': 'FT'
     }
-    for stat in stats_to_show:
-        result[stat] = f"{df_player[stat]:.1f}" if isinstance(df_player[stat], (float, np.floating)) else str(df_player[stat])
-        
-    return result
+    
+    column = stat_map.get(stat_category.upper(), None) # 대소문자 무시
+    
+    if not column:
+        return f"ERROR: 지원하지 않는 스탯 카테고리 ({stat_category})입니다. (득점, 리바운드, 어시스트 등만 가능)"
 
-# 특정 스탯 순위 검색 (캐싱 적용)
-@lru_cache(maxsize=128)
-def search_top_players(season, stat, top_n=3):
-    """특정 시즌의 특정 스탯에서 상위 N명의 선수를 조회합니다."""
-    if player_data_df is None:
-        return None
-    
-    min_games = player_data_df[player_data_df['Season'] == season]['G'].max() * 0.5
-    
-    df_season = player_data_df[
-        (player_data_df['Season'] == season) & 
-        (player_data_df['G'] >= min_games)
-    ].copy()
-    
-    if stat not in df_season.columns:
-        return None
-    
-    df_top = df_season.sort_values(by=stat, ascending=False).head(top_n)
-    
-    results = []
-    for _, row in df_top.iterrows():
-        results.append({
-            'rank': len(results) + 1,
-            'player': row['Player'],
-            'team': row['Team'],
-            'stat_value': f"{row[stat]:.2f}",
-            'stat_name': stat
-        })
+    # 데이터 프레임에서 검색
+    try:
+        top_players = per_game_df[per_game_df['Season'] == season].sort_values(by=column, ascending=False).head(top_n)
+    except KeyError:
+        return f"ERROR: {season} 시즌 데이터를 찾을 수 없거나 스탯 컬럼 이름({column})에 오류가 있습니다."
         
-    return results
+    if top_players.empty:
+        return f"ERROR: {season} 시즌의 TOP {top_n} 선수 기록을 찾을 수 없습니다."
 
-# 선수 개인 순위 검색 (캐싱 적용)
-@lru_cache(maxsize=128)
-def search_player_rank(player_name, season, stat):
-    """특정 선수가 특정 시즌의 특정 스탯에서 몇 위인지 조회합니다."""
-    if player_data_df is None:
-        return None
-    
-    min_games = player_data_df[player_data_df['Season'] == season]['G'].max() * 0.5
-    
-    df_filtered = player_data_df[
-        (player_data_df['Season'] == season) & 
-        (player_data_df['G'] >= min_games)
-    ].copy()
-    
-    if stat not in df_filtered.columns:
-        return None
+    # 결과 포맷팅
+    output = f"### 🏆 {season} 시즌 {stat_category.upper()} TOP {top_n} 선수\n\n"
+    for i, row in top_players.iterrows():
+        output += f"**{i+1}. {row['Player']}** ({row['Tm']}): {column} {row[column]:.1f}\n"
         
-    df_filtered['Rank'] = df_filtered[stat].rank(method='dense', ascending=False)
+    return output
+
+def get_team_standings(season, conference):
+    """특정 시즌 특정 컨퍼런스의 팀 순위를 검색합니다."""
     
-    player_row = df_filtered[df_filtered['Player'].str.contains(player_name, case=False, na=False)]
+    # 컨퍼런스 이름 정규화
+    conference = conference.lower().replace('동부', 'East').replace('서부', 'West')
     
-    if player_row.empty:
-        return None
+    if conference not in ['east', 'west']:
+        return "ERROR: 컨퍼런스는 '동부' 또는 '서부'만 입력할 수 있습니다."
+
+    # 데이터 프레임에서 검색
+    standings = standings_df[(standings_df['Season'] == season) & (standings_df['Conference'] == conference)].sort_values(by='Rk', ascending=True)
+    
+    if standings.empty:
+        return f"ERROR: {season} 시즌 {conference} 컨퍼런스 순위를 찾을 수 없습니다."
+
+    # 결과 포맷팅
+    output = f"### 📊 {season} 시즌 {conference.upper()} 컨퍼런스 순위\n\n"
+    for i, row in standings.iterrows():
+        output += f"**{int(row['Rk'])}. {row['Team']}** (승/패: {row['W']}/{row['L']}, 승률: {row['W/L']:.3f})\n"
         
-    rank_info = player_row.sort_values(by='Rank').iloc[0]
-    
-    return {
-        'player': rank_info['Player'],
-        'season': season,
-        'stat': stat,
-        'value': f"{rank_info[stat]:.1f}",
-        'rank': int(rank_info['Rank'])
-    }
+    return output
 
-
-# 팀 순위 검색 (캐싱 적용)
-@lru_cache(maxsize=128)
-def search_team_standings(season, conference, rank):
-    """특정 시즌의 특정 컨퍼런스에서 특정 순위의 팀을 조회합니다."""
-    if standings_data_df is None:
-        return None
-        
-    df_standings = standings_data_df[
-        (standings_data_df['Season'] == season) &
-        (standings_data_df['Conference'] == conference) &
-        (standings_data_df['Rank'] == rank)
-    ]
-    
-    if df_standings.empty:
-        return None
-        
-    return {
-        'season': season,
-        'conference': conference,
-        'rank': rank,
-        'team': df_standings.iloc[0]['Team']
-    }
-
-
-# ----------------------------------------------------------------------
-# 4. 질의응답 (Q&A) 처리 로직
-# ----------------------------------------------------------------------
+# --- 메인 쿼리 처리 함수 ---
 
 def handle_query(query):
-    """사용자 질의를 분석하고 적절한 함수를 호출하여 답변을 생성합니다."""
+    """사용자 쿼리를 분석하고 적절한 검색 함수를 호출합니다."""
+    
+    if not data_loaded:
+        return "데이터 파일을 로드하는 데 실패하여 검색을 수행할 수 없습니다. 서버 로그를 확인하세요."
+        
+    # 쿼리 전처리
     query = query.lower().strip()
     
-    if player_data_df is None:
-        return "데이터가 아직 로드되지 않았거나 로드에 실패했습니다. 잠시 후 다시 시도해주세요."
+    # --- 1. 시즌 및 선수 기록 조회 (예: '2023-24 시즌 르브론 제임스 득점 순위는?') ---
+    match_player_stats = re.search(r'(\d{4}-\d{2}) 시즌 (.+?) (주요 기록|득점|리바운드|어시스트|순위)는?', query)
+    if match_player_stats:
+        season, player_name, category = match_player_stats.groups()
+        player_name = player_name.strip()
         
-    seasons = [str(s) for s in range(2019, 2025)] 
-    default_season = '2023-24'
-    season = next((s for s in seasons if s in query), default_season)
+        # '순위' 요청이 들어오면 TOP N 검색 함수로 리디렉션
+        if '순위' in category:
+            # 순위 검색을 위해 어떤 스탯 순위를 묻는지 추가적으로 파악해야 함
+            # 예시 질문을 '2023-24 시즌 르브론 제임스 득점 순위는?' 와 같이 구체화해야 작동 가능
+            stat_match = re.search(r'(.+?) (득점|리바운드|어시스트|스틸|블록) 순위는?', query)
+            if stat_match:
+                stat_category = stat_match.group(2)
+                return search_top_players(season, stat_category, top_n=20) # 개인 순위는 TOP 20에서 찾아보도록 설정
+        
+        # '주요 기록' 요청 처리
+        return search_player_stats(player_name, season)
 
-    # 1. 선수 개인 스탯 순위 조회 (예: 르브론 제임스 득점 순위는?)
-    stat_keywords = {'득점': 'PTS', '리바운드': 'TRB', '어시스트': 'AST', '블록': 'BLK', '스틸': 'STL'}
-    for ko_stat, en_stat in stat_keywords.items():
-        if f"{ko_stat} 순위" in query or f"순위 {ko_stat}" in query:
-            for player in sorted(player_list, key=len, reverse=True):
-                if player.lower() in query:
-                    rank_result = search_player_rank(player, season, en_stat)
-                    if rank_result:
-                        return (f"📊 {rank_result['season']} 시즌 **{rank_result['player']}** 선수의 경기당 평균 **{ko_stat}** 기록은 "
-                                f"{rank_result['value']}로, 리그 전체 **{rank_result['rank']}위**입니다. (최소 경기 출전 기준)")
-                    break
+    # --- 2. TOP N 선수 기록 조회 (예: '2023-24 시즌 득점 TOP 5 선수는?') ---
+    match_top_n = re.search(r'(\d{4}-\d{2}) 시즌 (.+?) top (\d+) 선수는?', query)
+    if match_top_n:
+        season, stat_category, top_n = match_top_n.groups()
+        stat_category = stat_category.strip()
+        top_n = int(top_n)
+        return search_top_players(season, stat_category, top_n)
 
-    # 2. TOP N 선수 스탯 순위 조회 (예: 2023-24 시즌 리바운드 TOP 3 선수는?)
-    top_n = next((int(s) for s in query.split() if s.isdigit()), 3) 
-    for ko_stat, en_stat in stat_keywords.items():
-        if f"top {top_n} {ko_stat}" in query or f"{ko_stat} top {top_n}" in query or f"상위 {top_n} {ko_stat}" in query:
-            top_results = search_top_players(season, en_stat, top_n)
-            if top_results:
-                response = f"🥇 {season} 시즌 경기당 평균 **{ko_stat}** TOP {top_n} 선수 명단입니다 (최소 경기 출전 기준):\n"
-                for r in top_results:
-                    response += f"- **{r['rank']}위:** {r['player']} ({r['team']}) - {r['stat_value']} {ko_stat}\n"
-                return response.strip()
-            
-    # 3. 팀 순위 조회 (예: 2022-23 시즌 동부 1위 팀은?)
-    conf_keywords = {'동부': 'East', '서부': 'West'}
-    rank_keywords = {f'{i}위': i for i in range(1, 16)}
+    # --- 3. 팀 순위 조회 (예: '2023-24 시즌 동부 컨퍼런스 순위는?') ---
+    match_standings = re.search(r'(\d{4}-\d{2}) 시즌 (동부|서부) 컨퍼런스 순위는?', query)
+    if match_standings:
+        season, conference = match_standings.groups()
+        return get_team_standings(season, conference)
+        
+    # --- 매칭되는 유형이 없는 경우 ---
+    example_queries = [
+        "2023-24 시즌 르브론 제임스 주요 기록은?",
+        "2023-24 시즌 득점 TOP 5 선수는?",
+        "2023-24 시즌 동부 컨퍼런스 순위는?"
+    ]
+    return f"""
+    ### ⚠️ 현재 질문 유형은 지원하지 않습니다.
+    검색 가능한 질문 예시를 참고해주세요:
+    - {example_queries[0]}
+    - {example_queries[1]}
+    - {example_queries[2]}
+    """
 
-    for ko_conf, en_conf in conf_keywords.items():
-        for ko_rank, rank_num in rank_keywords.items():
-            if f"{ko_conf} 컨퍼런스 {ko_rank}" in query or f"{ko_conf} {ko_rank} 팀" in query:
-                standing_result = search_team_standings(season, en_conf, rank_num)
-                if standing_result:
-                    return f"🏀 {standing_result['season']} 시즌 **{ko_conf}** 컨퍼런스 **{standing_result['rank']}위** 팀은 **{standing_result['team']}** 입니다."
 
-    # 4. 선수 주요 기록 조회 (예: 2023-24 시즌 니콜라 요키치 주요 기록은?)
-    for player in sorted(player_list, key=len, reverse=True):
-        if player.lower() in query:
-            stats = search_player_stats(player, season)
-            if stats:
-                response = f"⛹️ **{stats['Player']}** 선수의 {stats['Season']} 시즌 주요 기록입니다 (평균):\n"
-                response += f"- 소속팀: **{stats['Team']}**\n"
-                response += f"- 득점(PTS): {stats['PTS']}\n"
-                response += f"- 리바운드(TRB): {stats['TRB']}\n"
-                response += f"- 어시스트(AST): {stats['AST']}\n"
-                response += f"- 야투율(FG%): {stats['FG%']}%\n"
-                response += f"- 출전 시간(MP): {stats['MP']}분\n"
-                response += f"- 스틸(STL): {stats['STL']}, 블록(BLK): {stats['BLK']}\n"
-                return response
-            
-    return f"🤔 죄송합니다. '{query}'에 대한 정보를 찾지 못했습니다. 질문을 좀 더 구체적으로 바꿔주시겠어요? (예: 2023-24 시즌 르브론 제임스 득점 순위는?)"
+# --- Flask 라우팅 ---
 
-# ----------------------------------------------------------------------
-# 5. Flask 라우트 및 HTML 템플릿
-# ----------------------------------------------------------------------
+# 질문을 처리하는 API 엔드포인트 (프론트엔드 JavaScript에서 이 경로로 POST 요청을 보냄)
+@app.route('/api/query', methods=['POST'])
+def api_query():
+    data = request.get_json()
+    query = data.get('query', '')
+    
+    # 🚨 DEBUGGING: 어떤 쿼리가 들어왔는지 로그 출력
+    print(f"DEBUG: Received query: {query}") 
+    
+    result = handle_query(query)
+    
+    # 🚨 DEBUGGING: 어떤 결과가 나가는지 로그 출력
+    print(f"DEBUG: Response result: {result[:50]}...")
+    
+    return jsonify({'result': result})
+
+
+# 메인 페이지를 렌더링하는 엔드포인트
+@app.route('/', methods=['GET', 'POST'])
+def index():
+    # POST 요청은 /api/query로 리디렉션되었으므로, 여기서는 GET 요청만 처리
+    return render_template_string(HTML_TEMPLATE)
+
+
+# --- HTML 템플릿 (JavaScript 수정 포함) ---
 
 HTML_TEMPLATE = """
-<!doctype html>
+<!DOCTYPE html>
 <html lang="ko">
 <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
-    <title>🏀 NBA 데이터 Q&A 시스템</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NBA Q&A 챗봇</title>
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;700&display=swap" rel="stylesheet">
     <style>
-        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f4f7f6; color: #333; margin: 0; padding: 20px; }
-        .container { max-width: 800px; margin: auto; background: #fff; padding: 30px; border-radius: 12px; box-shadow: 0 6px 20px rgba(0, 0, 0, 0.1); }
-        h1 { color: #004d98; text-align: center; margin-bottom: 25px; font-weight: 700; border-bottom: 3px solid #f9a01b; padding-bottom: 10px; }
-        h2 { color: #f9a01b; font-size: 1.2em; margin-top: 20px; }
-        .form-group { margin-bottom: 20px; }
-        #query-input { width: 100%; padding: 15px; border: 2px solid #ddd; border-radius: 8px; font-size: 16px; box-sizing: border-box; transition: border-color 0.3s; }
-        #query-input:focus { border-color: #004d98; outline: none; }
-        #submit-btn { width: 100%; padding: 12px; background-color: #004d98; color: white; border: none; border-radius: 8px; font-size: 18px; cursor: pointer; transition: background-color 0.3s, transform 0.1s; }
-        #submit-btn:hover { background-color: #003366; }
-        #submit-btn:active { transform: scale(0.99); }
-        #response-container { background: #e8f4fd; padding: 20px; border-radius: 8px; min-height: 100px; margin-top: 25px; border-left: 5px solid #004d98; white-space: pre-wrap; word-wrap: break-word; line-height: 1.6; }
-        .example-list { list-style: none; padding: 0; margin-top: 15px; }
-        .example-list li { background: #fff; margin-bottom: 8px; padding: 10px; border-radius: 6px; border: 1px solid #eee; cursor: pointer; transition: background-color 0.2s; }
-        .example-list li:hover { background-color: #f0f8ff; }
-        .status-message { text-align: center; margin-top: 15px; padding: 10px; border-radius: 6px; }
-        .status-loading { background-color: #fff3cd; color: #856404; border: 1px solid #ffeeba; }
-        .status-ready { background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
-        .response-intro { font-weight: bold; color: #333; margin-bottom: 10px; }
+        body {
+            font-family: 'Noto Sans KR', sans-serif;
+            background-color: #f4f7f6;
+            color: #333;
+            margin: 0;
+            padding: 0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        .container {
+            background-color: #ffffff;
+            width: 90%;
+            max-width: 800px;
+            margin: 40px auto;
+            border-radius: 12px;
+            box-shadow: 0 10px 25px rgba(0, 0, 0, 0.1);
+            overflow: hidden;
+        }
+        header {
+            background-color: #1a1a1a;
+            color: white;
+            padding: 30px 20px;
+            text-align: center;
+            border-bottom: 5px solid #ff4500;
+        }
+        header h1 {
+            margin: 0;
+            font-size: 2em;
+        }
+        header p {
+            margin-top: 5px;
+            font-size: 0.9em;
+            color: #ccc;
+        }
+        .chat-window {
+            height: 500px;
+            overflow-y: auto;
+            padding: 20px;
+            border-bottom: 1px solid #eee;
+        }
+        .message-box {
+            margin-bottom: 15px;
+            display: flex;
+        }
+        .message-box.user {
+            justify-content: flex-end;
+        }
+        .message-box.bot {
+            justify-content: flex-start;
+        }
+        .message {
+            max-width: 70%;
+            padding: 12px 18px;
+            border-radius: 20px;
+            line-height: 1.5;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+        }
+        .message.user {
+            background-color: #ff4500;
+            color: white;
+            border-bottom-right-radius: 5px;
+        }
+        .message.bot {
+            background-color: #e6e6e6;
+            color: #333;
+            border-bottom-left-radius: 5px;
+        }
+        .input-area {
+            padding: 20px;
+            display: flex;
+            background-color: #f9f9f9;
+        }
+        .input-area input[type="text"] {
+            flex-grow: 1;
+            padding: 12px;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            font-size: 1em;
+            margin-right: 10px;
+            outline: none;
+        }
+        .input-area button {
+            background-color: #1a1a1a;
+            color: white;
+            border: none;
+            padding: 12px 20px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 1em;
+            transition: background-color 0.3s;
+        }
+        .input-area button:hover {
+            background-color: #333;
+        }
+        .message.bot pre {
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            font-family: 'Noto Sans KR', sans-serif;
+            margin: 5px 0 0;
+            padding: 0;
+            background: none;
+            border: none;
+        }
+        .message.bot h3 {
+            margin-top: 0;
+            color: #ff4500;
+        }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>🏀 NBA 데이터 Q&A 시스템</h1>
-        
-        <div id="status-message" class="status-message {{ status_class }}">
-            {{ status_text }}
-        </div>
-
-        <form id="qa-form">
-            <div class="form-group">
-                <input type="text" id="query-input" name="query" placeholder="궁금한 것을 물어보세요 (예: 르브론 제임스 득점 순위는?)" required>
+        <header>
+            <h1>NBA Q&A 챗봇</h1>
+            <p>NBA 데이터를 기반으로 선수 기록, 순위 등을 알려드립니다.</p>
+        </header>
+        <div class="chat-window" id="chatWindow">
+            <div class="message-box bot">
+                <div class="message">
+                    안녕하세요! NBA 데이터에 대해 궁금한 점을 질문해 주세요.<br><br>
+                    **검색 예시:**
+                    <br>- 2023-24 시즌 르브론 제임스 주요 기록은?
+                    <br>- 2023-24 시즌 득점 TOP 5 선수는?
+                    <br>- 2023-24 시즌 동부 컨퍼런스 순위는?
+                </div>
             </div>
-            <button type="submit" id="submit-btn">검색</button>
-        </form>
-
-        <div id="response-container">
-            <div class="response-intro">응답:</div>
-            {{ response|default('여기에 답변이 표시됩니다.', true) }}
         </div>
-
-        <h2>💡 자주 묻는 질문 예시</h2>
-        <ul class="example-list">
-            <li onclick="document.getElementById('query-input').value='2023-24 시즌 니콜라 요키치 주요 기록은?'; document.getElementById('qa-form').requestSubmit();">2023-24 시즌 니콜라 요키치 주요 기록은?</li>
-            <li onclick="document.getElementById('query-input').value='2023-24 시즌 르브론 제임스 득점 순위는?'; document.getElementById('qa-form').requestSubmit();">2023-24 시즌 르브론 제임스 득점 순위는?</li>
-            <li onclick="document.getElementById('query-input').value='2022-23 시즌 동부 컨퍼런스 1위 팀은?'; document.getElementById('qa-form').requestSubmit();">2022-23 시즌 동부 컨퍼런스 1위 팀은?</li>
-            <li onclick="document.getElementById('query-input').value='2023-24 시즌 리바운드 TOP 5 선수는?'; document.getElementById('qa-form').requestSubmit();">2023-24 시즌 리바운드 TOP 5 선수는?</li>
-        </ul>
+        <div class="input-area">
+            <input type="text" id="userInput" placeholder="질문을 입력하세요..." onkeydown="if(event.key === 'Enter') sendMessage()">
+            <button onclick="sendMessage()">검색</button>
+        </div>
     </div>
-    
+
     <script>
-        document.getElementById('qa-form').addEventListener('submit', function(e) {
-            e.preventDefault();
-            const query = document.getElementById('query-input').value;
-            const responseContainer = document.getElementById('response-container');
-            // 답변 처리 중 메시지를 표시
-            responseContainer.innerHTML = '<div class="response-intro">응답:</div><p>답변을 처리 중입니다... ⏳</p>';
+        const chatWindow = document.getElementById('chatWindow');
+        const userInput = document.getElementById('userInput');
 
-            // /api/query 엔드포인트로 질문(query)을 POST 방식으로 전송
-            fetch('/api/query', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({ query: query })
-            })
-            .then(response => response.json())
-            .then(data => {
-                // 서버에서 받은 응답(data.response)을 HTML로 변환하여 표시
-                const responseText = data.response.replace(/\n/g, '<br>'); // 줄바꿈 처리
-                responseContainer.innerHTML = `<div class="response-intro">응답:</div>${responseText}`;
-            })
-            .catch(error => {
-                responseContainer.innerHTML = '<div class="response-intro">응답:</div><p style="color: red;">오류가 발생했습니다: ' + error + '</p>';
-            });
-        });
+        function addMessage(sender, text) {
+            const messageBox = document.createElement('div');
+            messageBox.classList.add('message-box', sender);
 
-        // 예시 질문 클릭 시, 입력 필드 업데이트 후 자동으로 폼 제출
-        document.querySelectorAll('.example-list li').forEach(item => {
-            item.addEventListener('click', function() {
-                // li 태그 안의 텍스트를 query로 사용
-                const query = this.textContent; 
-                document.getElementById('query-input').value = query;
-                document.getElementById('qa-form').dispatchEvent(new Event('submit'));
-            });
-        });
+            const message = document.createElement('div');
+            message.classList.add('message', sender);
+            
+            // Markdown 형식 처리를 위해 <pre> 태그 사용
+            if (sender === 'bot') {
+                const pre = document.createElement('pre');
+                pre.innerHTML = text.replace(/\\n/g, '<br>').replace(/\*\*(.*?)\*\*/g, '<b>$1</b>').replace(/###\s*(.*)/g, '<h3>$1</h3>').replace(/- (.*)/g, '• $1');
+                message.appendChild(pre);
+            } else {
+                message.textContent = text;
+            }
+
+            messageBox.appendChild(message);
+            chatWindow.appendChild(messageBox);
+            chatWindow.scrollTop = chatWindow.scrollHeight;
+        }
+
+        async function sendMessage() {
+            const query = userInput.value.trim();
+            if (query === "") return;
+
+            addMessage('user', query);
+            userInput.value = ''; // 입력창 비우기
+
+            // 챗봇 응답 대기 메시지
+            addMessage('bot', '검색 중입니다...');
+            const loadingMessage = chatWindow.lastChild.querySelector('.message');
+            
+            try {
+                // 🚨🚨🚨 중요한 수정 부분: API 경로를 '/api/query'로 변경 🚨🚨🚨
+                const response = await fetch('/api/query', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ query: query })
+                });
+
+                const data = await response.json();
+                
+                // 로딩 메시지 제거 후 실제 응답 표시
+                chatWindow.removeChild(chatWindow.lastChild);
+                addMessage('bot', data.result);
+                
+            } catch (error) {
+                console.error('Fetch error:', error);
+                chatWindow.removeChild(chatWindow.lastChild);
+                addMessage('bot', '죄송합니다. 서버 통신 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.');
+            }
+        }
     </script>
 </body>
 </html>
 """
 
-# 메인 페이지 라우트
-@app.route('/')
-def index():
-    """메인 페이지 렌더링"""
-    if player_data_df is None:
-        status_text = "데이터 로딩 중입니다... ⏳"
-        status_class = "status-loading"
-    else:
-        status_text = "데이터 로드 완료! 🚀 질문을 시작하세요."
-        status_class = "status-ready"
-        
-    return render_template_string(HTML_TEMPLATE, status_text=status_text, status_class=status_class)
-
-# API 엔드포인트
-@app.route('/api/query', methods=['POST'])
-def api_query():
-    """질의응답 API"""
-    data = request.get_json()
-    query = data.get('query', '')
-    
-    response_text = handle_query(query)
-    
-    return jsonify({'response': response_text})
-
-# 서버 실행
 if __name__ == '__main__':
-    print("==================================================")
-    print("💡 Flask 웹 서버 시작")
-    print("🔗 http://127.0.0.1:5000/")
-    print("==================================================")
+    # 로컬 테스트 시
     app.run(debug=True)
